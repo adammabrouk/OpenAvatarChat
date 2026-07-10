@@ -110,7 +110,12 @@ class HandlerTTS(HandlerBase, ABC):
             text = re.sub(r"<\|.*?\|>", "", text)
             context.input_text += self.filter_text(text)
 
-        text_end = inputs.data.get_meta("avatar_text_end", False)
+        # Finalize on either the avatar_text_end meta (set by qwen_omni) OR is_last_data
+        # (how openai_compatible / most LLMs signal end-of-stream). Without the is_last_data
+        # fallback, Edge TTS never finalizes with an openai_compatible LLM, so the avatar
+        # never reaches LISTENING, CLIENT_PLAYBACK never closes, and the VAD stays disabled
+        # after the first turn (one-turn-per-connection deadlock).
+        text_end = inputs.data.get_meta("avatar_text_end", False) or inputs.is_last_data
         if not text_end:
             sentences = re.split(r'(?<=[,.~!?，。！？])', context.input_text)
             if len(sentences) > 1:  # 至少有一个完整句子
