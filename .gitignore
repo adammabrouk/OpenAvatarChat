@@ -56,3 +56,6 @@ tests/**/outputs/
 
 # tmux session logs
 tmux-client-*.log
+
+.DS_Store
+**/.DS_Store

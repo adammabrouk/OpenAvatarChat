@@ -1,0 +1,11 @@
+# Installed ON TOP of the OpenAvatarChat env (which already provides torch + MuseTalk deps).
+# API / UI:
+fastapi
+uvicorn[standard]
+python-multipart
+# audio/video helpers used by engine + worker:
+librosa
+opencv-python-headless
+# LiveKit worker only:
+livekit-agents>=1.0
+livekit

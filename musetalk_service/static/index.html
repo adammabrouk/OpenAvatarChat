@@ -1,0 +1,92 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>MuseTalk avatar service</title>
+<style>
+  :root { color-scheme: light dark; }
+  body { font-family: system-ui, sans-serif; max-width: 860px; margin: 2rem auto; padding: 0 1rem; }
+  h1 { font-size: 1.4rem; }
+  section { border: 1px solid #8884; border-radius: 12px; padding: 1rem 1.25rem; margin: 1rem 0; }
+  h2 { font-size: 1.05rem; margin-top: 0; }
+  label { display: block; font-size: .85rem; margin: .6rem 0 .2rem; opacity: .8; }
+  input, select, button { font: inherit; padding: .5rem .6rem; border-radius: 8px; border: 1px solid #8886; background: transparent; color: inherit; }
+  button { cursor: pointer; background: #3b82f6; color: #fff; border: none; padding: .55rem 1rem; }
+  button:disabled { opacity: .5; cursor: default; }
+  .row { display: flex; gap: .75rem; flex-wrap: wrap; align-items: end; }
+  .status { font-size: .85rem; margin-top: .6rem; min-height: 1.2em; opacity: .85; }
+  video { width: 100%; margin-top: .75rem; border-radius: 10px; background: #000; }
+  code { background: #8882; padding: .1rem .3rem; border-radius: 4px; }
+</style>
+</head>
+<body>
+  <h1>🎬 MuseTalk avatar service</h1>
+  <p>Set up a <b>persona</b> from an initial video, then send a <b>wav</b> and watch the avatar react.</p>
+
+  <section>
+    <h2>1 · Set up a persona (from an initial video)</h2>
+    <div class="row">
+      <div><label>Persona name</label><input id="pname" placeholder="presenter_1" /></div>
+      <div><label>Face video (mp4)</label><input id="pvideo" type="file" accept="video/*" /></div>
+      <button id="pbtn" onclick="createPersona()">Prepare persona</button>
+    </div>
+    <div class="status" id="pstatus"></div>
+  </section>
+
+  <section>
+    <h2>2 · Test: send a wav → see the avatar speak</h2>
+    <div class="row">
+      <div><label>Persona</label><select id="psel"></select></div>
+      <div><label>Audio (wav)</label><input id="pwav" type="file" accept="audio/*" /></div>
+      <button id="sbtn" onclick="speak()">Send audio</button>
+    </div>
+    <div class="status" id="sstatus"></div>
+    <video id="out" controls></video>
+  </section>
+
+<script>
+async function refresh() {
+  const r = await fetch('/personas'); const list = await r.json();
+  const sel = document.getElementById('psel');
+  sel.innerHTML = '';
+  for (const p of list) { const o = document.createElement('option'); o.value = p.id; o.textContent = p.id; sel.appendChild(o); }
+  if (!list.length) { const o = document.createElement('option'); o.textContent = '(none yet — set one up above)'; o.disabled = true; sel.appendChild(o); }
+}
+async function createPersona() {
+  const name = document.getElementById('pname').value;
+  const video = document.getElementById('pvideo').files[0];
+  if (!video) { document.getElementById('pstatus').textContent = 'Pick a video first.'; return; }
+  const fd = new FormData(); fd.append('name', name); fd.append('video', video);
+  const btn = document.getElementById('pbtn'); btn.disabled = true;
+  document.getElementById('pstatus').textContent = 'Preparing (one-time, ~seconds–minutes)…';
+  try {
+    const r = await fetch('/personas', { method: 'POST', body: fd });
+    const j = await r.json();
+    document.getElementById('pstatus').textContent = r.ok ? `✅ persona "${j.id}" ready (${j.cycle_frames} frames)` : `❌ ${j.detail || 'failed'}`;
+    await refresh();
+  } catch (e) { document.getElementById('pstatus').textContent = '❌ ' + e; }
+  btn.disabled = false;
+}
+async function speak() {
+  const pid = document.getElementById('psel').value;
+  const wav = document.getElementById('pwav').files[0];
+  if (!pid || !wav) { document.getElementById('sstatus').textContent = 'Pick a persona and a wav.'; return; }
+  const fd = new FormData(); fd.append('audio', wav);
+  const btn = document.getElementById('sbtn'); btn.disabled = true;
+  document.getElementById('sstatus').textContent = 'Synthesizing…';
+  try {
+    const r = await fetch(`/personas/${pid}/speak`, { method: 'POST', body: fd });
+    if (!r.ok) { const j = await r.json().catch(() => ({})); document.getElementById('sstatus').textContent = '❌ ' + (j.detail || r.status); }
+    else {
+      const blob = await r.blob();
+      document.getElementById('out').src = URL.createObjectURL(blob);
+      document.getElementById('sstatus').textContent = '✅ done';
+    }
+  } catch (e) { document.getElementById('sstatus').textContent = '❌ ' + e; }
+  btn.disabled = false;
+}
+refresh();
+</script>
+</body>
+</html>
