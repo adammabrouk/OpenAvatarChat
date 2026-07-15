@@ -18,15 +18,21 @@ get the API + UI running on your Azure T4, then test it. When it's green you add
 The plan: make sure the repo + Docker image exist on the VM, then **copy your new files up**, download the
 MuseTalk weights, and run the service inside the image (which already has torch + all MuseTalk deps).
 
-Set these once (Mac shell):
+**Each step below is tagged 🖥️ *your Mac* or ☁️ *the VM (after `ssh`)* — run it on that machine.**
+`az …` and `rsync …` run on your **Mac** (needs `az login`); `docker …` / `download_models` run **on the VM**.
+
+Set these once (🖥️ **Mac** shell — `az login` first):
 ```bash
-export VM_IP=<your VM public IP>          # az vm show -d -g $RG -n $VM --query publicIps -o tsv
+export RG=oac-rg                          # your resource group (from deploy-azure-t4.md)
+export VM=oac-t4                           # your VM name
 export VM_USER=azureuser
+export VM_IP=$(az vm show -d -g $RG -n $VM --query publicIps -o tsv)   # or paste the IP
+echo "VM = $VM_IP"
 ```
 
 ---
 
-## 1. Ensure the repo + image exist on the VM
+## 1. Ensure the repo + image exist on the VM  · ☁️ on the VM
 
 **If the VM is fresh**, do the driver + clone + build steps from `docs/deploy-azure-t4.md` first:
 - §3a NVIDIA driver, §3b Docker + NVIDIA Container Toolkit
@@ -40,7 +46,7 @@ export VM_USER=azureuser
 
 ---
 
-## 2. Copy your new files up to the VM
+## 2. Copy your new files up to the VM  · 🖥️ on your Mac
 
 Your `musetalk_service/` (and the config/docs) aren't in upstream, so push them from the Mac:
 ```bash
@@ -53,7 +59,7 @@ rsync -av docs/musetalk-*.md docs/livekit_*.py   $VM_USER@$VM_IP:~/OpenAvatarCha
 
 ---
 
-## 3. Download the MuseTalk weights (once)
+## 3. Download the MuseTalk weights (once)  · ☁️ on the VM (SSH in first)
 
 ```bash
 ssh $VM_USER@$VM_IP
@@ -67,16 +73,31 @@ This fills `models/musetalk/...` (unet, whisper, dwpose, sd-vae, face-parse, s3f
 
 ---
 
-## 4. Open the one port you need
+## 4. Open the one port you need  · 🖥️ on your Mac (Azure CLI — or use the Portal)
 
-The API/UI path returns a file (no WebRTC), so **just one TCP port**:
+This opens the VM's firewall so your browser can reach the service. The API/UI path returns a file
+(no WebRTC), so you only need **one TCP port: 8000**.
+
+> ⚠️ **Run this on your Mac, NOT inside the VM.** `az` is the Azure control-plane CLI — it configures the
+> VM's network from outside. If you're still SSH'd in from Step 3, open a **new Mac terminal** (or type
+> `exit` to leave the SSH), then run the command there. It needs `az login` and the `$RG`/`$VM` you set in
+> Step 0.
+
+**Option A — Azure CLI (on your Mac):**
 ```bash
+# these are from Step 0 (RG=oac-rg, VM=oac-t4 by default); make sure they're set in THIS terminal:
+export RG=oac-rg VM=oac-t4
 az vm open-port -g $RG -n $VM --port 8000 --priority 1010
 ```
 
+**Option B — Azure Portal (no CLI):** portal.azure.com → your VM → **Networking** →
+**Add inbound port rule** → Destination port ranges **8000**, Protocol **TCP**, Action **Allow** → **Add**.
+
+Either way, you're just adding an inbound-allow rule for TCP 8000. Nothing runs on the VM in this step.
+
 ---
 
-## 5. Run the service inside the image
+## 5. Run the service inside the image  · ☁️ on the VM
 
 We mount only `musetalk_service/` + `models/` into the image (NOT the whole repo — that would shadow the
 baked-in venv), install the few extra deps, and launch uvicorn on 8000:
@@ -85,17 +106,24 @@ baked-in venv), install the few extra deps, and launch uvicorn on 8000:
 cd ~/OpenAvatarChat
 
 docker run -d --name musetalk-svc --gpus all --restart unless-stopped \
+  -e XFORMERS_IGNORE_FLASH_VERSION_CHECK=1 \
   -v $(pwd)/musetalk_service:/root/open-avatar-chat/musetalk_service \
   -v $(pwd)/models:/root/open-avatar-chat/models \
   -p 8000:8000 \
   --entrypoint bash open-avatar-chat:latest -c '
     cd /root/open-avatar-chat &&
-    uv pip install fastapi "uvicorn[standard]" python-multipart librosa opencv-python-headless &&
+    uv pip install python-multipart &&
     OAC_ROOT=/root/open-avatar-chat \
       uv run --no-sync uvicorn --app-dir musetalk_service api:app --host 0.0.0.0 --port 8000'
 
 docker logs -f musetalk-svc      # watch it load models, then "Uvicorn running on 0.0.0.0:8000"
 ```
+> Two things that bite here (already handled above):
+> - **Only install `python-multipart`.** fastapi/uvicorn/numpy/opencv/librosa are already in the image;
+>   installing opencv/numpy again upgrades numpy to 2.x and breaks the pinned env.
+> - **`XFORMERS_IGNORE_FLASH_VERSION_CHECK=1`** — MuseTalk→diffusers→xformers hard-fails on a flash-attn
+>   version mismatch without it. (`engine.py` also sets this itself as a backstop.)
+> If a previous attempt left a crashed container: `docker rm -f musetalk-svc` before re-running.
 Prepared personas land in the mounted `models/musetalk/avatar_model/` → they persist across restarts and are
 shared with the LiveKit worker.
 
@@ -105,7 +133,7 @@ shared with the LiveKit worker.
 
 ---
 
-## 6. Test it
+## 6. Test it  · 🖥️ browser / Mac
 
 Open **http://$VM_IP:8000** in your browser:
 1. **Set up a persona** — name it, upload a short face video → *Prepare persona* (one-time; watch `docker logs`).
@@ -122,7 +150,7 @@ If it works, you've validated the whole MuseTalk path (persona setup + audio→a
 
 ---
 
-## 7. Manage the container
+## 7. Manage the container  · ☁️ on the VM
 
 ```bash
 docker logs -f musetalk-svc      # logs

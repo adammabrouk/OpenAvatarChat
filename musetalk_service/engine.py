@@ -28,6 +28,11 @@ sys.path.insert(0, os.path.join(OAC_ROOT, "src"))
 sys.path.insert(0, os.path.join(OAC_ROOT, "src", "handlers", "avatar", "musetalk", "MuseTalk"))
 os.chdir(OAC_ROOT)
 
+# MuseTalk pulls in diffusers -> xformers, which HARD-FAILS at import if the installed flash-attn
+# version is outside its pinned window (e.g. 2.8.3 vs the expected <=2.8.2). OpenAvatarChat's own
+# handlers set this too — bypass the guard. Must be set BEFORE importing musetalk.
+os.environ.setdefault("XFORMERS_IGNORE_FLASH_VERSION_CHECK", "1")
+
 from handlers.avatar.musetalk.musetalk_algo import MuseTalkAlgoV15  # noqa: E402
 
 # --- paths (match OpenAvatarChat's musetalk handler) ---
