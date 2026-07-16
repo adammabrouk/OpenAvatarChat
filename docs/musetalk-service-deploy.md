@@ -151,6 +151,7 @@ docker logs -f musetalk-svc      # watch it load models, then "Uvicorn running o
 | `MUSETALK_VAD_THRESHOLD` | `0.5` | live mode: **Silero VAD** speech-probability gate (streaming, uses the repo's own `silero_vad.onnx`) — windows below it idle instead of running inference. **Adjustable live from the UI slider**; the UI shows your live speech probability (green = will lip-sync). One hangover window after speech renders the mouth closing naturally |
 | `MUSETALK_SILENCE_RMS` | `0.01` | live mode: fallback energy gate used only if the Silero model can't load |
 | `MUSETALK_CONTEXT_SEC` | `0.3` | live mode: audio from the previous window prepended before whisper extraction (context frames dropped after) — stabilizes the mouth at window boundaries; raise to 0.5 if lips still jitter |
+| `MUSETALK_TAIL_SEC` | `0.25` | live mode: how much is rendered AFTER the last detected speech (mouth-close tail). Generation cuts right there — no post-speech stutter from rendering silent window remainders |
 | `MUSETALK_JPEG_QUALITY` | `80` | live mode: JPEG quality of streamed frames |
 
 Every `/speak` logs a **STAGE SUMMARY** (whisper / frame_gen / blend / pipe_write / ffmpeg + realtime

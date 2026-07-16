@@ -38,6 +38,10 @@ CONTEXT_SEC = float(os.environ.get("MUSETALK_CONTEXT_SEC", "0.3"))
 # Speech gates: Silero VAD probability if the model loads, else peak-100ms-RMS energy.
 VAD_THRESHOLD = float(os.environ.get("MUSETALK_VAD_THRESHOLD", "0.5"))
 SILENCE_RMS = float(os.environ.get("MUSETALK_SILENCE_RMS", "0.01"))
+# How much gets rendered AFTER the last detected speech (mouth-close tail). Generation
+# stops right there instead of playing out the window's silent remainder — this is what
+# keeps the mouth from stuttering for seconds after you stop talking.
+TAIL_SEC = float(os.environ.get("MUSETALK_TAIL_SEC", "0.25"))
 
 
 class StreamVad:
@@ -71,18 +75,24 @@ class StreamVad:
     def available(self) -> bool:
         return self.session is not None
 
-    def max_prob(self, seg: np.ndarray) -> float:
-        """Max speech probability over the segment's 512-sample chunks (streaming state)."""
-        buf = np.concatenate([self._rest, seg]) if len(self._rest) else seg
+    def analyze(self, seg: np.ndarray, gate: float) -> tuple[float, int]:
+        """Run streaming VAD over the segment's 512-sample chunks.
+        Returns (peak probability, end sample of the LAST speech chunk, seg-relative;
+        -1 if no chunk crossed the gate)."""
+        rest_len = len(self._rest)
+        buf = np.concatenate([self._rest, seg]) if rest_len else seg
         n = len(buf) // self.CHUNK
-        peak = 0.0
+        peak, last_end = 0.0, -1
         for i in range(n):
             clip = buf[i * self.CHUNK:(i + 1) * self.CHUNK][np.newaxis, :]
             prob, self._state = self.session.run(
                 None, {"input": clip, "sr": self._sr_arr, "state": self._state})
-            peak = max(peak, float(prob[0][0]))
+            p = float(prob[0][0])
+            peak = max(peak, p)
+            if p >= gate:
+                last_end = (i + 1) * self.CHUNK - rest_len
         self._rest = buf[n * self.CHUNK:]
-        return peak
+        return peak, max(last_end, -1)
 
 
 class LiveSession:
@@ -153,19 +163,26 @@ class LiveSession:
             self._counter += n
             return start
 
-    def _measure(self, seg: np.ndarray) -> bool:
-        """Speech gate. Silero VAD prob (streaming) when available, else peak-100ms RMS."""
+    def _measure(self, seg: np.ndarray) -> tuple[bool, int]:
+        """Speech gate. Returns (is_speech, end sample of last speech in the window).
+        Silero VAD prob (streaming) when available, else peak-100ms RMS."""
         if self.vad.available:
-            self.level = round(self.vad.max_prob(seg), 3)
+            peak, last_end = self.vad.analyze(seg, self.gate)
+            self.level = round(peak, 3)
         else:
             step = max(1, int(0.1 * self.sr))
-            peak = 0.0
+            peak, last_end = 0.0, -1
             for i in range(0, len(seg), step):
                 c = seg[i:i + step]
                 if len(c):
-                    peak = max(peak, float(np.sqrt(np.mean(c * c))))
+                    r = float(np.sqrt(np.mean(c * c)))
+                    peak = max(peak, r)
+                    if r >= self.gate:
+                        last_end = i + len(c)
             self.level = round(peak, 4)
-        return self.gate <= 0 or self.level >= self.gate
+        if self.gate <= 0:
+            return True, len(seg)
+        return self.level >= self.gate, last_end
 
     # ---- generation (blocking; run via asyncio.to_thread) ----
     def generate_window(self, now: float) -> int:
@@ -177,10 +194,19 @@ class LiveSession:
         context = self._tail
         self._tail = seg[-self.context_samples:] if self.context_samples > 0 else self._tail
 
-        if self._measure(seg):
+        tail_frames = max(1, int(round(TAIL_SEC * self.fps)))
+        speech, last_end = self._measure(seg)
+        keep = None  # None = the whole window (mid-utterance)
+        if speech:
             self._hangover = 1
+            # Speech ended INSIDE this window: render up to the last speech + a short
+            # mouth-close tail, not the window's silent remainder (post-speech stutter).
+            if 0 <= last_end < len(seg) - int(TAIL_SEC * self.sr):
+                keep = int(np.ceil(last_end / self.sr * self.fps)) + tail_frames
+                self._hangover = 0  # the close is already rendered
         elif self._hangover > 0:
-            self._hangover -= 1  # render ONE silent window: the mouth closes naturally
+            self._hangover -= 1
+            keep = tail_frames  # speech ended at the window edge: short close, not a full window
         else:
             self._speaking = False
             self.silent_windows += 1
@@ -194,6 +220,8 @@ class LiveSession:
         frames_per_window = int(round(self.window_samples / self.sr * self.fps))
         n_drop = max(len(chunks) - frames_per_window, 0)
         chunks = chunks[n_drop:]
+        if keep is not None:
+            chunks = chunks[:max(keep, 1)]
         n = len(chunks)
         if n == 0:
             return 0
@@ -204,4 +232,6 @@ class LiveSession:
             wb = chunks[i:i + batch]
             for recon, idx in self.algo.generate_frames(wb, start + i, len(wb)):
                 self.pending.append((self.algo.res2combined(recon, idx), idx))
+        if keep is not None and self._hangover == 0:
+            self._speaking = False  # segment closed — next utterance re-syncs to the client loop
         return n

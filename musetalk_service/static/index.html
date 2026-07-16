@@ -131,7 +131,7 @@ function startPainter(fps) {
   const img = document.getElementById('live');
   const vid = document.getElementById('liveidle');
   livePaint = setInterval(() => {
-    if (lastFrameAt && performance.now() - lastFrameAt > 600 && img.style.opacity !== '0') {
+    if (lastFrameAt && performance.now() - lastFrameAt > 350 && img.style.opacity !== '0') {
       // speech ended: resume the loop from where the generated frames left off
       if (lastIdx >= 0 && vid.duration) {
         const cycleFrames = Math.max(1, Math.round(vid.duration * liveFps));
