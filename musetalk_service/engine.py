@@ -16,6 +16,7 @@ import json
 import time
 import uuid
 import shutil
+import threading
 import subprocess
 from typing import Optional
 
@@ -134,13 +135,14 @@ def prepare_persona(persona_id: str, video_path: str) -> dict:
     adir = os.path.join(_personas_root(), persona_id)
     if os.path.isdir(adir):
         shutil.rmtree(adir, ignore_errors=True)  # overwrite cleanly
-    _loaded.clear()  # evict any in-memory persona (stale same-id data / free GPU room for prep)
 
-    with t.stage("models_and_prepare"):  # ctor = model load + prepare_material (see [PREP] logs)
-        algo = _make_algo(persona_id, used_path, force=True)
-    n = len(algo.frame_list_cycle) if algo.frame_list_cycle is not None else 0
-    algo.force_preparation = False  # prepared; keep it warm so the first /speak skips the reload
-    _loaded.update(id=persona_id, algo=algo)
+    with _load_lock:  # model construction is not thread-safe (see load_persona)
+        _loaded.clear()  # evict any in-memory persona (stale same-id data / free GPU room for prep)
+        with t.stage("models_and_prepare"):  # ctor = model load + prepare_material (see [PREP] logs)
+            algo = _make_algo(persona_id, used_path, force=True)
+        n = len(algo.frame_list_cycle) if algo.frame_list_cycle is not None else 0
+        algo.force_preparation = False  # prepared; keep it warm so the first /speak skips the reload
+        _loaded.update(id=persona_id, algo=algo)
 
     gpu = sampler.stop()
     profile = t.finish(gpu=gpu, source_frames=src_frames,
@@ -152,19 +154,24 @@ def prepare_persona(persona_id: str, video_path: str) -> dict:
 
 # The MuseTalk model set is heavy (~GB). Keep ONE loaded persona in-process (LRU=1).
 _loaded: dict = {}
+# Model loading is NOT thread-safe (diffusers' fast-init leaves "meta" tensors when two
+# threads construct concurrently) — e.g. the live WS and GET /idle.mp4 fire together.
+# One lock: the second caller waits and reuses the first caller's load.
+_load_lock = threading.Lock()
 
 
 def load_persona(persona_id: str) -> MuseTalkAlgoV15:
-    if _loaded.get("id") != persona_id:
-        prev = _loaded.get("id")
-        logger.info(f"load_persona[{persona_id}] cold load (was: {prev or 'none'}; LRU=1 — "
-                    f"persona switches reload the full model set)")
-        t0 = time.perf_counter()
-        algo = _make_algo(persona_id, "", force=False)  # ctor loads models + cached persona data
-        _loaded.clear()
-        _loaded.update(id=persona_id, algo=algo)
-        logger.info(f"load_persona[{persona_id}] ready in {time.perf_counter() - t0:.2f}s")
-    return _loaded["algo"]
+    with _load_lock:
+        if _loaded.get("id") != persona_id:
+            prev = _loaded.get("id")
+            logger.info(f"load_persona[{persona_id}] cold load (was: {prev or 'none'}; LRU=1 — "
+                        f"persona switches reload the full model set)")
+            t0 = time.perf_counter()
+            algo = _make_algo(persona_id, "", force=False)  # ctor loads models + cached persona data
+            _loaded.clear()
+            _loaded.update(id=persona_id, algo=algo)
+            logger.info(f"load_persona[{persona_id}] ready in {time.perf_counter() - t0:.2f}s")
+        return _loaded["algo"]
 
 
 # --------------------------------------------------------------- video output ---
