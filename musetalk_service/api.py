@@ -15,14 +15,18 @@ Run inside the OpenAvatarChat env:  uvicorn api:app --host 0.0.0.0 --port 8000
 Env: MUSETALK_LOG_LEVEL=DEBUG for verbose logs, MUSETALK_DEBUG=1 for per-batch GPU timings.
 """
 import os
+import json
 import time
 import uuid
 import shutil
+import asyncio
 
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException
+import cv2
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse, FileResponse, JSONResponse
 
 import engine
+import live as live_mode
 from profiling import logger, gpu_snapshot
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -104,3 +108,83 @@ def speak(persona_id: str, audio: UploadFile = File(...)):
     }
     return FileResponse(outp, media_type="video/mp4", filename=os.path.basename(outp),
                         headers=headers)
+
+
+@app.websocket("/personas/{persona_id}/live")
+async def live_ws(ws: WebSocket, persona_id: str):
+    """Live mic mode: client streams 16kHz mono Int16 PCM (binary messages);
+    server streams back JPEG frames (binary) + per-second JSON stats (text)."""
+    await ws.accept()
+    if persona_id not in {p["id"] for p in engine.list_personas()}:
+        await ws.close(code=4004, reason="persona not found")
+        return
+    algo = await asyncio.to_thread(engine.load_persona, persona_id)
+    sess = live_mode.LiveSession(algo)
+    logger.info(f"live[{persona_id}] session start — fps={sess.fps}, "
+                f"window={live_mode.WINDOW_SEC}s ({sess.window_samples} samples), batch={engine.BATCH}")
+
+    async def receiver():
+        try:
+            while not sess.stopped:
+                msg = await ws.receive()
+                if msg.get("type") == "websocket.disconnect":
+                    break
+                if msg.get("bytes"):
+                    sess.add_audio_pcm16(msg["bytes"])
+                elif msg.get("text") == "stop":
+                    break
+        except (WebSocketDisconnect, RuntimeError):
+            pass
+        finally:
+            sess.stopped = True
+
+    rx = asyncio.create_task(receiver())
+    gen_task = None
+    interval = 1.0 / sess.fps
+    jpeg_params = [cv2.IMWRITE_JPEG_QUALITY, live_mode.JPEG_QUALITY]
+    sent = spoken = 0
+    t0 = last_stats = time.perf_counter()
+    next_t = t0
+    try:
+        while not sess.stopped:
+            # kick one background generation whenever a full audio window is buffered
+            if sess.has_window() and (gen_task is None or gen_task.done()):
+                gen_task = asyncio.create_task(asyncio.to_thread(sess.generate_window))
+            if sess.pending:
+                frame = sess.pending.popleft()
+                spoken += 1
+            else:
+                frame = sess.next_idle_frame()
+            ok, jpg = cv2.imencode(".jpg", frame, jpeg_params)
+            if ok:
+                await ws.send_bytes(jpg.tobytes())
+                sent += 1
+            now = time.perf_counter()
+            if now - last_stats >= 1.0:
+                await ws.send_text(json.dumps({
+                    "type": "stats",
+                    "sent_fps": round(sent / (now - t0), 1),
+                    "target_fps": sess.fps,
+                    "speaking": bool(sess.pending),
+                    "audio_backlog_sec": round(sess.audio_backlog_sec(), 2),
+                    "pending_frames": len(sess.pending),
+                }))
+                last_stats = now
+            next_t += interval
+            delay = next_t - time.perf_counter()
+            if delay > 0:
+                await asyncio.sleep(delay)
+            else:
+                next_t = time.perf_counter()  # fell behind — reset the clock, don't spiral
+    except (WebSocketDisconnect, RuntimeError):
+        pass
+    finally:
+        sess.stopped = True
+        rx.cancel()
+        if gen_task is not None:
+            try:
+                await gen_task
+            except Exception:
+                pass
+        logger.info(f"live[{persona_id}] session end — {sent} frames sent "
+                    f"({spoken} speech, {sent - spoken} idle, {time.perf_counter() - t0:.1f}s)")

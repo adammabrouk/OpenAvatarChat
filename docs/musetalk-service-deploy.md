@@ -145,6 +145,9 @@ docker logs -f musetalk-svc      # watch it load models, then "Uvicorn running o
 | `MUSETALK_ENCODER` | `auto` | `auto` = NVENC if usable else libx264; or force `nvenc` / `libx264` |
 | `MUSETALK_MAX_FRAMES` | `75` | cap source frames in persona prep (≈3 s loop @25fps); `0` = use all |
 | `MUSETALK_GPU_SAMPLE_SEC` | `1.0` | GPU sampling interval during operations; `0` disables |
+| `MUSETALK_FPS` | `25` | avatar frame rate. **For live mic mode, set it to your measured throughput** (e.g. `15` on the T4) so generation keeps up with your voice |
+| `MUSETALK_WINDOW_SEC` | `1.0` | live mode: audio window per inference round — also the baseline avatar lag behind your voice |
+| `MUSETALK_JPEG_QUALITY` | `80` | live mode: JPEG quality of streamed frames |
 
 Every `/speak` logs a **STAGE SUMMARY** (whisper / frame_gen / blend / pipe_write / ffmpeg + realtime
 factor + GPU util/mem) and writes a sidecar `<output>.mp4.profile.json` in `OUTPUT_DIR`
@@ -189,6 +192,52 @@ curl -F audio=@speech.wav  http://$VM_IP:8000/personas/presenter_1/speak -o out.
 ```
 
 If it works, you've validated the whole MuseTalk path (persona setup + audio→avatar) end-to-end.
+
+---
+
+## 6b. Live mic mode — speak and watch the avatar follow  · 🖥️ Mac + ☁️ VM
+
+Section 3 of the UI streams your microphone to the server over a WebSocket (same TCP port 8000 —
+no WebRTC/TURN needed) and streams JPEG frames back: the avatar idles on its loop while you're
+silent and lip-syncs your speech about one audio window (~1 s) behind you.
+
+**Exact steps:**
+
+1. **Re-create the container with the fps matched to your GPU's measured throughput.** If your
+   `/speak` STAGE SUMMARY showed ~15 effective fps on the T4, run at 15 — at 25 the GPU can't keep
+   up with incoming speech and the avatar drifts further behind the longer you talk:
+   ```bash
+   # ☁️ on the VM
+   docker rm -f musetalk-svc
+   # re-run the Step 5 `docker run` with ONE extra env line:
+   #   -e MUSETALK_FPS=15 \
+   # (keep MUSETALK_DEBUG off for live use — its per-batch logging costs real throughput)
+   ```
+   Personas do NOT need re-preparing — fps only affects inference pacing, not the cached data.
+
+2. **Open the UI through an SSH tunnel** — browsers only allow the microphone on a *secure
+   context*, and `http://<VM_IP>:8000` isn't one; `http://localhost:8000` is:
+   ```bash
+   # 🖥️ on your Mac (leave it running)
+   ssh -L 8000:localhost:8000 $VM_USER@$VM_IP
+   ```
+   Then open **http://localhost:8000** (not the VM IP).
+
+3. **Section 3 → pick your persona (in section 2's dropdown) → "🎙️ Start live"** → allow the mic
+   and talk. The status line updates every second:
+   - `stream 15/15 fps` — the server is holding its frame clock;
+   - `lag ~1.2s` — how far the avatar is behind your voice (window + queued frames);
+   - `audio buffered` climbing past ~2 s ⚠️ — generation can't keep up: lower `MUSETALK_FPS`
+     or raise `MUSETALK_BATCH`.
+
+   Server-side, `docker logs -f musetalk-svc` shows the session (`live[<persona>] session start/end`).
+
+**How it works / knobs:** audio is sliced into `MUSETALK_WINDOW_SEC` (default 1.0 s) windows →
+whisper features → batched UNet+VAE (`MUSETALK_BATCH`) → blended frames queued and emitted on a
+`MUSETALK_FPS` clock; silence plays the idle loop at zero GPU cost, and one continuous cycle counter
+keeps head motion seamless across idle↔speak. Smaller windows = lower lag but worse GPU batching;
+0.6–1.0 s is the sweet spot. This is the same design as the LiveKit worker (§8) — the live tab is
+the single-user, one-port preview of it.
 
 ---
 

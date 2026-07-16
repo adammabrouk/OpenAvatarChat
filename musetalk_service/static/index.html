@@ -45,6 +45,20 @@
     <video id="out" controls></video>
   </section>
 
+  <section>
+    <h2>3 · Live: speak into the mic → watch the avatar follow</h2>
+    <p style="font-size:.85rem;opacity:.8;margin:.2rem 0 .6rem">
+      Uses the persona selected above. The browser only allows the mic on a <b>secure context</b> —
+      open this page via <code>http://localhost:8000</code> through an SSH tunnel (see the deploy doc §6b).
+      The avatar idles while you're silent and lip-syncs ~1 window (<code>MUSETALK_WINDOW_SEC</code>) behind your voice.
+    </p>
+    <div class="row">
+      <button id="lbtn" onclick="toggleLive()">🎙️ Start live</button>
+    </div>
+    <div class="status" id="lstatus"></div>
+    <img id="live" style="width:100%;margin-top:.75rem;border-radius:10px;background:#000;display:none" />
+  </section>
+
 <script>
 async function refresh() {
   const r = await fetch('/personas'); const list = await r.json();
@@ -90,6 +104,77 @@ async function speak() {
   } catch (e) { document.getElementById('sstatus').textContent = '❌ ' + e; }
   btn.disabled = false;
 }
+
+// ---------- live mic mode ----------
+let liveWs = null, liveCtx = null, liveStream = null, liveProc = null;
+
+async function toggleLive() {
+  if (liveWs) { stopLive('stopped'); return; }
+  const pid = document.getElementById('psel').value;
+  const st = document.getElementById('lstatus');
+  if (!pid) { st.textContent = 'Pick a persona in section 2 first.'; return; }
+  if (!navigator.mediaDevices?.getUserMedia) {
+    st.textContent = '❌ Mic unavailable — this page must be opened on a secure context (use the SSH tunnel: http://localhost:8000).';
+    return;
+  }
+  try {
+    liveStream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true } });
+  } catch (e) { st.textContent = '❌ mic permission denied: ' + e; return; }
+
+  const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+  liveWs = new WebSocket(`${proto}://${location.host}/personas/${pid}/live`);
+  liveWs.binaryType = 'arraybuffer';
+  const img = document.getElementById('live');
+  img.style.display = 'block';
+  document.getElementById('lbtn').textContent = '⏹ Stop live';
+  st.textContent = 'connecting…';
+
+  liveWs.onmessage = (e) => {
+    if (typeof e.data === 'string') {
+      const s = JSON.parse(e.data);
+      if (s.type === 'stats') {
+        const lag = s.audio_backlog_sec + s.pending_frames / s.target_fps;
+        st.textContent = `${s.speaking ? '🗣 speaking' : '😐 idle'} | stream ${s.sent_fps}/${s.target_fps} fps`
+          + ` | lag ~${lag.toFixed(1)}s (audio buffered ${s.audio_backlog_sec}s, frames queued ${s.pending_frames})`
+          + (s.audio_backlog_sec > 2 ? ' ⚠️ GPU falling behind — lower MUSETALK_FPS' : '');
+      }
+    } else {
+      const url = URL.createObjectURL(new Blob([e.data], { type: 'image/jpeg' }));
+      img.onload = () => URL.revokeObjectURL(url);
+      img.src = url;
+    }
+  };
+  liveWs.onclose = () => stopLive('connection closed');
+  liveWs.onerror = () => stopLive('❌ websocket error');
+
+  // mic -> Float32 @ native rate -> downsample to 16 kHz Int16 -> ws
+  liveCtx = new AudioContext();
+  const src = liveCtx.createMediaStreamSource(liveStream);
+  liveProc = liveCtx.createScriptProcessor(4096, 1, 1);
+  const mute = liveCtx.createGain(); mute.gain.value = 0;    // keep graph alive w/o echoing the mic
+  src.connect(liveProc); liveProc.connect(mute); mute.connect(liveCtx.destination);
+  const ratio = liveCtx.sampleRate / 16000;
+  liveProc.onaudioprocess = (ev) => {
+    if (!liveWs || liveWs.readyState !== 1) return;
+    const inp = ev.inputBuffer.getChannelData(0);
+    const out = new Int16Array(Math.floor(inp.length / ratio));
+    for (let i = 0; i < out.length; i++) {
+      const v = Math.max(-1, Math.min(1, inp[Math.floor(i * ratio)]));
+      out[i] = v * 32767;
+    }
+    liveWs.send(out.buffer);
+  };
+}
+
+function stopLive(msg) {
+  if (liveProc) { try { liveProc.disconnect(); } catch (e) {} liveProc = null; }
+  if (liveCtx) { try { liveCtx.close(); } catch (e) {} liveCtx = null; }
+  if (liveStream) { liveStream.getTracks().forEach(t => t.stop()); liveStream = null; }
+  if (liveWs) { const w = liveWs; liveWs = null; try { w.send('stop'); w.close(); } catch (e) {} }
+  document.getElementById('lbtn').textContent = '🎙️ Start live';
+  document.getElementById('lstatus').textContent = msg || '';
+}
+
 refresh();
 </script>
 </body>
