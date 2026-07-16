@@ -341,6 +341,7 @@ class MuseTalkAlgoV15:
 
     def _prepare_material_impl(self):
         logger.info("preparing data materials ... ...")
+        t_prep0 = time.time()
 
         if not self.video_path or not os.path.exists(self.video_path):
             logger.error(f"avatar_video_path does not exist: {self.video_path!r}")
@@ -362,14 +363,20 @@ class MuseTalkAlgoV15:
             files = [file for file in files if file.split(".")[-1] == "png"]
             for filename in files:
                 shutil.copyfile(f"{self.video_path}/{filename}", f"{self.full_imgs_path}/{filename}")
-                
+
         # Get all input image paths and sort
         input_img_list = sorted(glob.glob(os.path.join(self.full_imgs_path, '*.[jpJP][pnPN]*[gG]')))
+        t_extract = time.time()
+        n_src = len(input_img_list)
+        logger.info(f"[PREP] frame extraction: {n_src} frames in {t_extract - t_prep0:.1f}s")
 
         # Step 3: Extract face landmarks and bounding boxes
         logger.info("extracting landmarks...")
         coord_list, frame_list = get_landmark_and_bbox(input_img_list, self.bbox_shift)
-        
+        t_landmark = time.time()
+        logger.info(f"[PREP] face detect+landmarks (dwpose+s3fd): {t_landmark - t_extract:.1f}s "
+                    f"({(t_landmark - t_extract) / max(n_src, 1) * 1000:.0f}ms/frame)")
+
         # Step 4: Extract latent features
         input_latent_list = []
         idx = -1
@@ -395,6 +402,10 @@ class MuseTalkAlgoV15:
             # Use VAE to extract latent features
             latents = self.vae.get_latents_for_unet(resized_crop_frame)
             input_latent_list.append(latents)
+
+        t_vae = time.time()
+        logger.info(f"[PREP] VAE encode: {len(input_latent_list)} frames in {t_vae - t_landmark:.1f}s "
+                    f"({(t_vae - t_landmark) / max(len(input_latent_list), 1) * 1000:.0f}ms/frame)")
 
         # Step 5: Build cycle sequence (by forward + reverse order)
         self.frame_list_cycle = frame_list + frame_list[::-1]
@@ -424,6 +435,13 @@ class MuseTalkAlgoV15:
             cv2.imwrite(f"{self.mask_out_path}/{str(i).zfill(8)}.png", mask)
             self.mask_coords_list_cycle += [crop_box]
             self.mask_list_cycle.append(mask)
+            if (i + 1) % 50 == 0:
+                logger.info(f"[PREP] masks {i + 1}/{len(self.frame_list_cycle)}")
+
+        t_mask = time.time()
+        logger.info(f"[PREP] mask build (face-parse, over the doubled fwd+rev cycle): "
+                    f"{len(self.frame_list_cycle)} frames in {t_mask - t_vae:.1f}s "
+                    f"({(t_mask - t_vae) / max(len(self.frame_list_cycle), 1) * 1000:.0f}ms/frame)")
 
         # Step 7: Save all processed data
         # Save mask coordinates
@@ -444,6 +462,12 @@ class MuseTalkAlgoV15:
         # Save mask data
         with open(self.masks_path, 'wb') as f:
             pickle.dump(self.mask_list_cycle, f)
+
+        t_prep1 = time.time()
+        logger.info(f"[PREP] SUMMARY: total={t_prep1 - t_prep0:.1f}s | extract={t_extract - t_prep0:.1f}s "
+                    f"| detect={t_landmark - t_extract:.1f}s | vae={t_vae - t_landmark:.1f}s "
+                    f"| masks={t_mask - t_vae:.1f}s | save={t_prep1 - t_mask:.1f}s "
+                    f"| src_frames={n_src} cycle_frames={len(self.frame_list_cycle)}")
 
 
     def acc_get_image_blending(self, image, face, face_box, mask_array, crop_box):

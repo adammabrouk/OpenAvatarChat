@@ -52,6 +52,8 @@ Your `musetalk_service/` (and the config/docs) aren't in upstream, so push them 
 ```bash
 # from the repo root on your Mac
 rsync -av musetalk_service            $VM_USER@$VM_IP:~/OpenAvatarChat/
+rsync -av src/handlers/avatar/musetalk/musetalk_algo.py \
+          $VM_USER@$VM_IP:~/OpenAvatarChat/src/handlers/avatar/musetalk/   # patched engine ([PREP] timings, used via the src/ mount)
 rsync -av config/chat_with_musetalk_english.yaml $VM_USER@$VM_IP:~/OpenAvatarChat/config/
 rsync -av docs/musetalk-*.md docs/livekit_*.py   $VM_USER@$VM_IP:~/OpenAvatarChat/docs/
 ```
@@ -107,23 +109,63 @@ cd ~/OpenAvatarChat
 
 docker run -d --name musetalk-svc --gpus all --restart unless-stopped \
   -e XFORMERS_IGNORE_FLASH_VERSION_CHECK=1 \
+  -e NVIDIA_DRIVER_CAPABILITIES=compute,utility,video \
+  -e MUSETALK_LOG_LEVEL=INFO \
   -v $(pwd)/musetalk_service:/root/open-avatar-chat/musetalk_service \
+  -v $(pwd)/src:/root/open-avatar-chat/src \
   -v $(pwd)/models:/root/open-avatar-chat/models \
   -p 8000:8000 \
   --entrypoint bash open-avatar-chat:latest -c '
     cd /root/open-avatar-chat &&
-    uv pip install python-multipart &&
+    uv pip install python-multipart nvidia-ml-py &&
     OAC_ROOT=/root/open-avatar-chat \
       uv run --no-sync uvicorn --app-dir musetalk_service api:app --host 0.0.0.0 --port 8000'
 
 docker logs -f musetalk-svc      # watch it load models, then "Uvicorn running on 0.0.0.0:8000"
 ```
-> Two things that bite here (already handled above):
-> - **Only install `python-multipart`.** fastapi/uvicorn/numpy/opencv/librosa are already in the image;
->   installing opencv/numpy again upgrades numpy to 2.x and breaks the pinned env.
+> Things that bite here (already handled above):
+> - **Only install `python-multipart` + `nvidia-ml-py`.** fastapi/uvicorn/numpy/opencv/librosa are already
+>   in the image; installing opencv/numpy again upgrades numpy to 2.x and breaks the pinned env.
 > - **`XFORMERS_IGNORE_FLASH_VERSION_CHECK=1`** — MuseTalk→diffusers→xformers hard-fails on a flash-attn
 >   version mismatch without it. (`engine.py` also sets this itself as a backstop.)
+> - **`NVIDIA_DRIVER_CAPABILITIES=compute,utility,video`** — the `video` capability exposes NVENC so the
+>   service can hardware-encode the output mp4 (it auto-falls back to libx264 if unavailable).
+> - **Mount `src/` too** — the service imports the repo's MuseTalk engine from `src/handlers/avatar/musetalk`;
+>   mounting it means engine fixes (and its prep-stage `[PREP]` timing logs) apply without a rebuild.
+>   Mount only `musetalk_service/`, `src/`, `models/` — never the whole repo (it would shadow the baked venv).
 > If a previous attempt left a crashed container: `docker rm -f musetalk-svc` before re-running.
+
+### Performance / profiling knobs
+
+| Env var | Default | Meaning |
+|---|---|---|
+| `MUSETALK_LOG_LEVEL` | `INFO` | `DEBUG` adds rolling per-25-frame progress lines |
+| `MUSETALK_DEBUG` | `0` | `1` = per-batch UNet/VAE/blend `[PROFILE]` logs from the algo (drill-down) |
+| `MUSETALK_BATCH` | `4` | frames per GPU call in `/speak`; try `8` on the T4, watch `mem_peak_mb` |
+| `MUSETALK_ENCODER` | `auto` | `auto` = NVENC if usable else libx264; or force `nvenc` / `libx264` |
+| `MUSETALK_MAX_FRAMES` | `75` | cap source frames in persona prep (≈3 s loop @25fps); `0` = use all |
+| `MUSETALK_GPU_SAMPLE_SEC` | `1.0` | GPU sampling interval during operations; `0` disables |
+
+Every `/speak` logs a **STAGE SUMMARY** (whisper / frame_gen / blend / pipe_write / ffmpeg + realtime
+factor + GPU util/mem) and writes a sidecar `<output>.mp4.profile.json` in `OUTPUT_DIR`
+(`/tmp/musetalk_outputs` in the container). Persona prep logs `[PREP]` stage timings and writes
+`prepare.profile.json` into the persona folder (persisted in the mounted `models/`). The mp4 response
+carries `X-Render-Seconds`, `X-Audio-Seconds`, `X-Realtime-Factor`, `X-Fps` headers.
+
+### Monitoring the GPU from your side
+
+```bash
+curl http://$VM_IP:8000/gpu                  # live util/mem/power via the service (NVML)
+# ☁️ on the VM:
+nvidia-smi dmon -s pucm -d 1                 # 1 Hz power/util/clock/mem stream while a render runs
+watch -n1 nvidia-smi                         # classic view
+docker exec musetalk-svc nvidia-smi          # confirm the container actually sees the GPU
+# read a profile sidecar:
+docker exec musetalk-svc sh -c 'ls -t /tmp/musetalk_outputs/*.profile.json | head -1 | xargs cat'
+```
+How to read it: **low GPU util with `frame_gen` dominant** → raise `MUSETALK_BATCH`; **high `blend`/
+`pipe_write`** → CPU-bound compositing/IO; **high `ffmpeg_wait`** → encoder-bound (check the
+`video encoder:` log line says `h264_nvenc`, not `libx264`).
 Prepared personas land in the mounted `models/musetalk/avatar_model/` → they persist across restarts and are
 shared with the LiveKit worker.
 

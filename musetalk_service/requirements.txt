@@ -6,6 +6,8 @@ python-multipart
 # audio/video helpers used by engine + worker:
 librosa
 opencv-python-headless
+# GPU profiling (NVML bindings; safe no-op if the GPU is absent):
+nvidia-ml-py
 # LiveKit worker only:
 livekit-agents>=1.0
 livekit

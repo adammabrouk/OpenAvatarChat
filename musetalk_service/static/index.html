@@ -81,7 +81,11 @@ async function speak() {
     else {
       const blob = await r.blob();
       document.getElementById('out').src = URL.createObjectURL(blob);
-      document.getElementById('sstatus').textContent = '✅ done';
+      const rt = r.headers.get('X-Realtime-Factor'), rs = r.headers.get('X-Render-Seconds'),
+            as = r.headers.get('X-Audio-Seconds'), fps = r.headers.get('X-Fps');
+      document.getElementById('sstatus').textContent = rt
+        ? `✅ rendered ${as}s of audio in ${rs}s — ${rt}x realtime, ${fps} fps` + (parseFloat(rt) > 1 ? ' ⚠️ slower than realtime' : '')
+        : '✅ done';
     }
   } catch (e) { document.getElementById('sstatus').textContent = '❌ ' + e; }
   btn.disabled = false;
