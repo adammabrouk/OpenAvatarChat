@@ -480,12 +480,21 @@ class MuseTalkAlgoV15:
         x, y, x1, y1 = face_box
         x_s, y_s, x_e, y_e = crop_box
 
-        body_crop = image[y_s:y_e, x_s:x_e].copy()
+        # crop_box comes from get_crop_box(face_box, expand=1.5) and can extend past the
+        # frame edges (prep builds the mask with PIL.crop, which zero-pads out-of-bounds).
+        # numpy slicing does NOT pad — a negative y_s like -2 wraps around and yields an
+        # empty slice — so clamp the box to the frame and offset into the mask to match.
+        img_h, img_w = image.shape[:2]
+        cx_s, cy_s = max(x_s, 0), max(y_s, 0)
+        cx_e, cy_e = min(x_e, img_w), min(y_e, img_h)
+
+        body_crop = image[cy_s:cy_e, cx_s:cx_e].copy()
         face_large1 = body_crop.copy()
 
-        face_large1[y-y_s:y1-y_s, x-x_s:x1-x_s] = face
+        face_large1[y-cy_s:y1-cy_s, x-cx_s:x1-cx_s] = face
 
         mask_f = mask_array.astype(np.float32) * (1.0 / 255.0)
+        mask_f = mask_f[cy_s-y_s:cy_e-y_s, cx_s-x_s:cx_e-x_s]  # same clamp as the crop
         mask_f = mask_f[:, :, np.newaxis]  # (H, W, 1) — broadcasts to 3-ch
 
         if face_large1.shape[:2] != mask_f.shape[:2]:
@@ -497,7 +506,7 @@ class MuseTalkAlgoV15:
 
         blended = (face_large1 * mask_f + body_crop * (1.0 - mask_f)).astype(np.uint8)
 
-        image[y_s:y_e, x_s:x_e] = blended
+        image[cy_s:cy_s + blended.shape[0], cx_s:cx_s + blended.shape[1]] = blended
         return image
 
     def res2combined(self, res_frame, idx):
