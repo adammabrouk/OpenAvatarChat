@@ -148,6 +148,7 @@ docker logs -f musetalk-svc      # watch it load models, then "Uvicorn running o
 | `MUSETALK_FPS` | `25` | avatar frame rate. **For live mic mode, set it to your measured throughput** (e.g. `15` on the T4) so generation keeps up with your voice |
 | `MUSETALK_WINDOW_SEC` | `1.0` | live mode: audio window per inference round — also the baseline avatar lag behind your voice |
 | `MUSETALK_MAX_LAG_SEC` | `2.0` | live mode: max buffered speech; older audio is **dropped** so the avatar stays near-realtime instead of drifting behind |
+| `MUSETALK_SILENCE_RMS` | `0.01` | live mode: **default** silence gate — windows quieter than this idle instead of running inference (mouth stays still). **Adjustable live from the UI slider** (no restart); the UI shows your live mic level next to it (green = above gate = will lip-sync). After speech ends, one extra silent window is still rendered so the mouth closes naturally |
 | `MUSETALK_JPEG_QUALITY` | `80` | live mode: JPEG quality of streamed frames |
 
 Every `/speak` logs a **STAGE SUMMARY** (whisper / frame_gen / blend / pipe_write / ffmpeg + realtime
@@ -233,12 +234,15 @@ silent and lip-syncs your speech about one audio window (~1 s) behind you.
 
    Server-side, `docker logs -f musetalk-svc` shows the session (`live[<persona>] session start/end`).
 
-**How it works / knobs:** audio is sliced into `MUSETALK_WINDOW_SEC` (default 1.0 s) windows →
-whisper features → batched UNet+VAE (`MUSETALK_BATCH`) → blended frames queued and emitted on a
-`MUSETALK_FPS` clock; silence plays the idle loop at zero GPU cost, and one continuous cycle counter
-keeps head motion seamless across idle↔speak. Smaller windows = lower lag but worse GPU batching;
-0.6–1.0 s is the sweet spot. This is the same design as the LiveKit worker (§8) — the live tab is
-the single-user, one-port preview of it.
+**How it works / knobs:** the browser plays the persona's **idle loop natively** (`GET
+/personas/<id>/idle.mp4` — rendered once from the prepared cycle and cached, so the very first live
+session takes a few extra seconds) and the WebSocket only carries frames **while there is speech**:
+audio is sliced into `MUSETALK_WINDOW_SEC` (default 1.0 s) windows → silence gate → whisper features
+→ batched UNet+VAE (`MUSETALK_BATCH`) → speech frames streamed FIFO on a `MUSETALK_FPS` clock, overlaid
+on the loop (with a short cross-fade); when frames stop, the overlay fades back to the loop. Silence
+costs zero GPU AND zero bandwidth. Smaller windows = lower lag but worse GPU batching; 0.6–1.0 s is
+the sweet spot. This is the same design as the LiveKit worker (§8) — the live tab is the single-user,
+one-port preview of it.
 
 **Staying realtime (drop policy):** live mode never lets the avatar drift more than
 `MUSETALK_MAX_LAG_SEC` (default 2 s) behind you — if the GPU can't keep up with your speech, the

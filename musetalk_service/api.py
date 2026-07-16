@@ -110,6 +110,20 @@ def speak(persona_id: str, audio: UploadFile = File(...)):
                         headers=headers)
 
 
+@app.get("/personas/{persona_id}/idle.mp4")
+def idle_video(persona_id: str):
+    """The persona's idle cycle as a loopable mp4 (rendered once, cached).
+    The live UI plays this natively; the WS only streams frames during speech."""
+    if persona_id not in {p["id"] for p in engine.list_personas()}:
+        raise HTTPException(404, "persona not found — set it up first")
+    try:
+        path = engine.idle_loop_mp4(persona_id)
+    except Exception as e:
+        logger.exception(f"idle loop render failed: {persona_id}")
+        raise HTTPException(500, f"idle loop render failed: {e}")
+    return FileResponse(path, media_type="video/mp4")
+
+
 @app.websocket("/personas/{persona_id}/live")
 async def live_ws(ws: WebSocket, persona_id: str):
     """Live mic mode: client streams 16kHz mono Int16 PCM (binary messages);
@@ -131,8 +145,17 @@ async def live_ws(ws: WebSocket, persona_id: str):
                     break
                 if msg.get("bytes"):
                     sess.add_audio_pcm16(msg["bytes"])
-                elif msg.get("text") == "stop":
-                    break
+                elif msg.get("text"):
+                    txt = msg["text"]
+                    if txt == "stop":
+                        break
+                    try:
+                        cfg = json.loads(txt)
+                        if cfg.get("type") == "config" and "silence_rms" in cfg:
+                            sess.silence_rms = max(0.0, float(cfg["silence_rms"]))
+                            logger.info(f"live[{persona_id}] silence gate -> {sess.silence_rms}")
+                    except (ValueError, TypeError):
+                        pass
         except (WebSocketDisconnect, RuntimeError):
             pass
         finally:
@@ -142,7 +165,7 @@ async def live_ws(ws: WebSocket, persona_id: str):
     gen_task = None
     interval = 1.0 / sess.fps
     jpeg_params = [cv2.IMWRITE_JPEG_QUALITY, live_mode.JPEG_QUALITY]
-    sent = spoken = 0
+    sent = sent_prev = 0
     t0 = last_stats = time.perf_counter()
     next_t = t0
     try:
@@ -150,27 +173,29 @@ async def live_ws(ws: WebSocket, persona_id: str):
             # kick one background generation whenever a full audio window is buffered
             if sess.has_window() and (gen_task is None or gen_task.done()):
                 gen_task = asyncio.create_task(asyncio.to_thread(sess.generate_window))
+            # Speech frames only, FIFO, on the fps clock. During silence NOTHING is
+            # streamed — the browser falls back to the natively-looping idle.mp4.
             if sess.pending:
                 frame = sess.pending.popleft()
-                spoken += 1
-            else:
-                frame = sess.next_idle_frame()
-            ok, jpg = cv2.imencode(".jpg", frame, jpeg_params)
-            if ok:
-                await ws.send_bytes(jpg.tobytes())
-                sent += 1
+                ok, jpg = cv2.imencode(".jpg", frame, jpeg_params)
+                if ok:
+                    await ws.send_bytes(jpg.tobytes())
+                    sent += 1
             now = time.perf_counter()
             if now - last_stats >= 1.0:
                 await ws.send_text(json.dumps({
                     "type": "stats",
-                    "sent_fps": round(sent / (now - t0), 1),
+                    "sent_fps": round((sent - sent_prev) / (now - last_stats), 1),
                     "target_fps": sess.fps,
                     "speaking": bool(sess.pending),
                     "audio_backlog_sec": round(sess.audio_backlog_sec(), 2),
                     "pending_frames": len(sess.pending),
                     "dropped_audio_sec": round(sess.dropped_sec, 1),
+                    "mic_rms": round(sess.mic_rms, 4),
+                    "silence_gate": round(sess.silence_rms, 4),
                 }))
                 last_stats = now
+                sent_prev = sent
             next_t += interval
             delay = next_t - time.perf_counter()
             if delay > 0:
@@ -187,5 +212,5 @@ async def live_ws(ws: WebSocket, persona_id: str):
                 await gen_task
             except Exception:
                 pass
-        logger.info(f"live[{persona_id}] session end — {sent} frames sent "
-                    f"({spoken} speech, {sent - spoken} idle, {time.perf_counter() - t0:.1f}s)")
+        logger.info(f"live[{persona_id}] session end — {sent} speech frames streamed "
+                    f"in {time.perf_counter() - t0:.1f}s (idle played client-side)")

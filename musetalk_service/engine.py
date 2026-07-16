@@ -207,6 +207,41 @@ def _pick_encoder() -> tuple[str, list[str]]:
     return name, args
 
 
+def idle_loop_mp4(persona_id: str) -> str:
+    """Render the persona's idle cycle (fwd+rev source frames) to a seamless-loop mp4,
+    cached in the persona dir. The live UI plays this natively in the browser and only
+    receives streamed frames while the avatar is actually speaking."""
+    adir = os.path.join(_personas_root(), persona_id)
+    out = os.path.join(adir, f"idle_loop_{FPS}fps.mp4")
+    if os.path.isfile(out):
+        return out
+    algo = load_persona(persona_id)
+    frames = algo.frame_list_cycle
+    h, w = frames[0].shape[:2]
+    enc_name, enc_args = _pick_encoder()
+    logger.info(f"idle_loop_mp4[{persona_id}] rendering {len(frames)} frames @{FPS}fps ({enc_name})")
+    t0 = time.perf_counter()
+    cmd = ["ffmpeg", "-y", "-v", "warning",
+           "-f", "rawvideo", "-pix_fmt", "bgr24", "-s", f"{w}x{h}", "-r", str(FPS), "-i", "pipe:0",
+           *enc_args,
+           "-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2,format=yuv420p",
+           "-movflags", "+faststart", out]
+    proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL)
+    try:
+        for f in frames:
+            proc.stdin.write(np.ascontiguousarray(f, dtype=np.uint8).tobytes())
+        proc.stdin.close()
+        if proc.wait() != 0:
+            raise RuntimeError("ffmpeg failed rendering idle loop")
+    except BaseException:
+        proc.kill()
+        proc.wait()
+        raise
+    logger.info(f"idle_loop_mp4[{persona_id}] done in {time.perf_counter() - t0:.1f}s -> {out}")
+    return out
+
+
 def render_wav(persona_id: str, wav_path: str, out_path: str) -> tuple[str, dict]:
     """Batch: wav -> lip-synced mp4 (audio muxed). Returns (out_path, profile dict).
 

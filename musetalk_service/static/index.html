@@ -54,9 +54,19 @@
     </p>
     <div class="row">
       <button id="lbtn" onclick="toggleLive()">🎙️ Start live</button>
+      <div style="flex:1;min-width:260px">
+        <label>Silence gate: <b id="gateval">0.010</b> — mouth stays closed below this mic level
+          (your mic now: <b id="micval">–</b>)</label>
+        <input id="gate" type="range" min="0.001" max="0.05" step="0.001" value="0.010"
+               style="width:100%" oninput="setGate(this.value)" />
+      </div>
     </div>
     <div class="status" id="lstatus"></div>
-    <img id="live" style="width:100%;margin-top:.75rem;border-radius:10px;background:#000;display:none" />
+    <!-- idle loop plays natively underneath; streamed speech frames overlay it -->
+    <div id="livebox" style="position:relative;margin-top:.75rem;display:none">
+      <video id="liveidle" loop muted playsinline style="width:100%;border-radius:10px;background:#000;display:block;margin:0"></video>
+      <img id="live" style="position:absolute;inset:0;width:100%;height:100%;border-radius:10px;opacity:0;transition:opacity .15s" />
+    </div>
   </section>
 
 <script>
@@ -107,19 +117,21 @@ async function speak() {
 
 // ---------- live mic mode ----------
 let liveWs = null, liveCtx = null, liveStream = null, liveProc = null;
-let livePaint = null, liveLatest = null, liveDropped = 0;
+let livePaint = null, liveLatest = null, liveDropped = 0, lastFrameAt = 0;
 
-// Paint on OUR clock at the server's fps, always showing only the newest frame.
-// Network bursts (TCP/SSH-tunnel stalls) then collapse into dropped frames
-// instead of fast-forwarding the video.
+// The idle loop (idle.mp4) plays natively underneath at all times. Streamed speech
+// frames paint into the overlay <img> on OUR clock at the server's fps (newest frame
+// only — bursts collapse into drops, never fast-forward). When frames stop arriving
+// (silence), the overlay fades out and the loop shows through.
 function startPainter(fps) {
   if (livePaint) clearInterval(livePaint);
   const img = document.getElementById('live');
   livePaint = setInterval(() => {
+    if (lastFrameAt && performance.now() - lastFrameAt > 600) img.style.opacity = 0;  // back to idle loop
     if (!liveLatest) return;
     const url = URL.createObjectURL(new Blob([liveLatest], { type: 'image/jpeg' }));
     liveLatest = null;
-    img.onload = () => URL.revokeObjectURL(url);
+    img.onload = () => { URL.revokeObjectURL(url); img.style.opacity = 1; };
     img.src = url;
   }, 1000 / fps);
 }
@@ -140,17 +152,23 @@ async function toggleLive() {
   const proto = location.protocol === 'https:' ? 'wss' : 'ws';
   liveWs = new WebSocket(`${proto}://${location.host}/personas/${pid}/live`);
   liveWs.binaryType = 'arraybuffer';
-  const img = document.getElementById('live');
-  img.style.display = 'block';
+  document.getElementById('livebox').style.display = 'block';
+  const idleVid = document.getElementById('liveidle');
+  idleVid.src = `/personas/${pid}/idle.mp4`;   // rendered+cached server-side on first request
+  idleVid.play().catch(() => {});
   document.getElementById('lbtn').textContent = '⏹ Stop live';
   st.textContent = 'connecting…';
 
   startPainter(25);  // re-tuned to the real server fps on the first stats message
+  liveWs.onopen = () => setGate(document.getElementById('gate').value);  // sync slider -> session
   liveWs.onmessage = (e) => {
     if (typeof e.data === 'string') {
       const s = JSON.parse(e.data);
       if (s.type === 'stats') {
         if (s.target_fps !== startPainter.fps) { startPainter(s.target_fps); startPainter.fps = s.target_fps; }
+        const mv = document.getElementById('micval');
+        mv.textContent = s.mic_rms;
+        mv.style.color = s.mic_rms >= s.silence_gate ? '#16a34a' : '';  // green = above gate = will lip-sync
         const lag = s.audio_backlog_sec + s.pending_frames / s.target_fps;
         st.textContent = `${s.speaking ? '🗣 speaking' : '😐 idle'} | stream ${s.sent_fps}/${s.target_fps} fps`
           + ` | lag ~${lag.toFixed(1)}s (audio buffered ${s.audio_backlog_sec}s, frames queued ${s.pending_frames})`
@@ -160,6 +178,7 @@ async function toggleLive() {
     } else {
       if (liveLatest !== null) liveDropped++;  // painter hasn't consumed the previous one — drop it
       liveLatest = e.data;
+      lastFrameAt = performance.now();
     }
   };
   liveWs.onclose = () => stopLive('connection closed');
@@ -184,9 +203,17 @@ async function toggleLive() {
   };
 }
 
+function setGate(v) {
+  document.getElementById('gateval').textContent = (+v).toFixed(3);
+  if (liveWs && liveWs.readyState === 1) liveWs.send(JSON.stringify({ type: 'config', silence_rms: +v }));
+}
+
 function stopLive(msg) {
   if (livePaint) { clearInterval(livePaint); livePaint = null; }
-  liveLatest = null; liveDropped = 0;
+  liveLatest = null; liveDropped = 0; lastFrameAt = 0;
+  const idleVid = document.getElementById('liveidle');
+  try { idleVid.pause(); } catch (e) {}
+  document.getElementById('live').style.opacity = 0;
   if (liveProc) { try { liveProc.disconnect(); } catch (e) {} liveProc = null; }
   if (liveCtx) { try { liveCtx.close(); } catch (e) {} liveCtx = null; }
   if (liveStream) { liveStream.getTracks().forEach(t => t.stop()); liveStream = null; }
