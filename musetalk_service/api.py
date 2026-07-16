@@ -168,6 +168,7 @@ async def live_ws(ws: WebSocket, persona_id: str):
                     "speaking": bool(sess.pending),
                     "audio_backlog_sec": round(sess.audio_backlog_sec(), 2),
                     "pending_frames": len(sess.pending),
+                    "dropped_audio_sec": round(sess.dropped_sec, 1),
                 }))
                 last_stats = now
             next_t += interval

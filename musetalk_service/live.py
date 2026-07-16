@@ -24,6 +24,9 @@ from profiling import logger
 
 WINDOW_SEC = float(os.environ.get("MUSETALK_WINDOW_SEC", "1.0"))
 JPEG_QUALITY = int(os.environ.get("MUSETALK_JPEG_QUALITY", "80"))
+# Live mode must stay near-realtime: if the GPU can't keep up, DROP the oldest
+# buffered audio instead of letting the avatar drift ever further behind.
+MAX_LAG_SEC = float(os.environ.get("MUSETALK_MAX_LAG_SEC", "2.0"))
 
 
 class LiveSession:
@@ -41,12 +44,18 @@ class LiveSession:
         self._counter = 0  # ONE continuous cycle counter for idle AND speak frames
         self.pending: deque = deque()  # blended BGR frames ready to send (thread-safe ops only)
         self.stopped = False
+        self.dropped_sec = 0.0  # audio discarded to keep the avatar near-realtime
+        self._max_buffer = self.window_samples + int(MAX_LAG_SEC * self.sr)
 
     # ---- audio in (websocket receiver) ----
     def add_audio_pcm16(self, data: bytes):
         arr = np.frombuffer(data, dtype=np.int16).astype(np.float32) / 32768.0
         with self._audio_lock:
             self._audio = np.concatenate([self._audio, arr])
+            overflow = len(self._audio) - self._max_buffer
+            if overflow > 0:  # GPU behind — drop the OLDEST audio, keep the newest
+                self._audio = self._audio[overflow:]
+                self.dropped_sec += overflow / self.sr
 
     def audio_backlog_sec(self) -> float:
         return len(self._audio) / self.sr

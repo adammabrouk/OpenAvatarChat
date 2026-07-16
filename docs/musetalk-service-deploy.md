@@ -147,6 +147,7 @@ docker logs -f musetalk-svc      # watch it load models, then "Uvicorn running o
 | `MUSETALK_GPU_SAMPLE_SEC` | `1.0` | GPU sampling interval during operations; `0` disables |
 | `MUSETALK_FPS` | `25` | avatar frame rate. **For live mic mode, set it to your measured throughput** (e.g. `15` on the T4) so generation keeps up with your voice |
 | `MUSETALK_WINDOW_SEC` | `1.0` | live mode: audio window per inference round — also the baseline avatar lag behind your voice |
+| `MUSETALK_MAX_LAG_SEC` | `2.0` | live mode: max buffered speech; older audio is **dropped** so the avatar stays near-realtime instead of drifting behind |
 | `MUSETALK_JPEG_QUALITY` | `80` | live mode: JPEG quality of streamed frames |
 
 Every `/speak` logs a **STAGE SUMMARY** (whisper / frame_gen / blend / pipe_write / ffmpeg + realtime
@@ -238,6 +239,18 @@ whisper features → batched UNet+VAE (`MUSETALK_BATCH`) → blended frames queu
 keeps head motion seamless across idle↔speak. Smaller windows = lower lag but worse GPU batching;
 0.6–1.0 s is the sweet spot. This is the same design as the LiveKit worker (§8) — the live tab is
 the single-user, one-port preview of it.
+
+**Staying realtime (drop policy):** live mode never lets the avatar drift more than
+`MUSETALK_MAX_LAG_SEC` (default 2 s) behind you — if the GPU can't keep up with your speech, the
+*oldest* buffered audio is dropped (the stats line shows `dropped Xs audio`; the avatar skips those
+words but stays current). Likewise the browser paints on its own fps clock and skips burst frames
+after a network stall, so the video never "fast-forwards". If you see constant drops, the fps is
+still above the GPU's real throughput → lower `MUSETALK_FPS`.
+
+**Choosing the persona source video:** during silence the avatar plays your source clip untouched —
+only speech repaints the mouth. So pick (or trim to) a segment where the person is **not talking**
+(mouth closed/neutral, natural blinks). A clip of someone mid-speech will look like silent
+mouth-flapping whenever the avatar idles.
 
 ---
 

@@ -107,6 +107,22 @@ async function speak() {
 
 // ---------- live mic mode ----------
 let liveWs = null, liveCtx = null, liveStream = null, liveProc = null;
+let livePaint = null, liveLatest = null, liveDropped = 0;
+
+// Paint on OUR clock at the server's fps, always showing only the newest frame.
+// Network bursts (TCP/SSH-tunnel stalls) then collapse into dropped frames
+// instead of fast-forwarding the video.
+function startPainter(fps) {
+  if (livePaint) clearInterval(livePaint);
+  const img = document.getElementById('live');
+  livePaint = setInterval(() => {
+    if (!liveLatest) return;
+    const url = URL.createObjectURL(new Blob([liveLatest], { type: 'image/jpeg' }));
+    liveLatest = null;
+    img.onload = () => URL.revokeObjectURL(url);
+    img.src = url;
+  }, 1000 / fps);
+}
 
 async function toggleLive() {
   if (liveWs) { stopLive('stopped'); return; }
@@ -129,19 +145,21 @@ async function toggleLive() {
   document.getElementById('lbtn').textContent = '⏹ Stop live';
   st.textContent = 'connecting…';
 
+  startPainter(25);  // re-tuned to the real server fps on the first stats message
   liveWs.onmessage = (e) => {
     if (typeof e.data === 'string') {
       const s = JSON.parse(e.data);
       if (s.type === 'stats') {
+        if (s.target_fps !== startPainter.fps) { startPainter(s.target_fps); startPainter.fps = s.target_fps; }
         const lag = s.audio_backlog_sec + s.pending_frames / s.target_fps;
         st.textContent = `${s.speaking ? '🗣 speaking' : '😐 idle'} | stream ${s.sent_fps}/${s.target_fps} fps`
           + ` | lag ~${lag.toFixed(1)}s (audio buffered ${s.audio_backlog_sec}s, frames queued ${s.pending_frames})`
-          + (s.audio_backlog_sec > 2 ? ' ⚠️ GPU falling behind — lower MUSETALK_FPS' : '');
+          + (s.dropped_audio_sec > 0 ? ` | dropped ${s.dropped_audio_sec}s audio to stay realtime` : '')
+          + (liveDropped > 0 ? ` | ${liveDropped} burst frames skipped` : '');
       }
     } else {
-      const url = URL.createObjectURL(new Blob([e.data], { type: 'image/jpeg' }));
-      img.onload = () => URL.revokeObjectURL(url);
-      img.src = url;
+      if (liveLatest !== null) liveDropped++;  // painter hasn't consumed the previous one — drop it
+      liveLatest = e.data;
     }
   };
   liveWs.onclose = () => stopLive('connection closed');
@@ -167,6 +185,8 @@ async function toggleLive() {
 }
 
 function stopLive(msg) {
+  if (livePaint) { clearInterval(livePaint); livePaint = null; }
+  liveLatest = null; liveDropped = 0;
   if (liveProc) { try { liveProc.disconnect(); } catch (e) {} liveProc = null; }
   if (liveCtx) { try { liveCtx.close(); } catch (e) {} liveCtx = null; }
   if (liveStream) { liveStream.getTracks().forEach(t => t.stop()); liveStream = null; }
