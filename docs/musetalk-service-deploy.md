@@ -148,7 +148,9 @@ docker logs -f musetalk-svc      # watch it load models, then "Uvicorn running o
 | `MUSETALK_FPS` | `25` | avatar frame rate. **For live mic mode, set it to your measured throughput** (e.g. `15` on the T4) so generation keeps up with your voice |
 | `MUSETALK_WINDOW_SEC` | `1.0` | live mode: audio window per inference round — also the baseline avatar lag behind your voice |
 | `MUSETALK_MAX_LAG_SEC` | `2.0` | live mode: max buffered speech; older audio is **dropped** so the avatar stays near-realtime instead of drifting behind |
-| `MUSETALK_SILENCE_RMS` | `0.01` | live mode: **default** silence gate — windows quieter than this idle instead of running inference (mouth stays still). **Adjustable live from the UI slider** (no restart); the UI shows your live mic level next to it (green = above gate = will lip-sync). After speech ends, one extra silent window is still rendered so the mouth closes naturally |
+| `MUSETALK_VAD_THRESHOLD` | `0.5` | live mode: **Silero VAD** speech-probability gate (streaming, uses the repo's own `silero_vad.onnx`) — windows below it idle instead of running inference. **Adjustable live from the UI slider**; the UI shows your live speech probability (green = will lip-sync). One hangover window after speech renders the mouth closing naturally |
+| `MUSETALK_SILENCE_RMS` | `0.01` | live mode: fallback energy gate used only if the Silero model can't load |
+| `MUSETALK_CONTEXT_SEC` | `0.3` | live mode: audio from the previous window prepended before whisper extraction (context frames dropped after) — stabilizes the mouth at window boundaries; raise to 0.5 if lips still jitter |
 | `MUSETALK_JPEG_QUALITY` | `80` | live mode: JPEG quality of streamed frames |
 
 Every `/speak` logs a **STAGE SUMMARY** (whisper / frame_gen / blend / pipe_write / ffmpeg + realtime
@@ -250,6 +252,16 @@ one-port preview of it.
 words but stays current). Likewise the browser paints on its own fps clock and skips burst frames
 after a network stall, so the video never "fast-forwards". If you see constant drops, the fps is
 still above the GPU's real throughput → lower `MUSETALK_FPS`.
+
+**Idle↔speech continuity:** the browser reports its idle-loop position twice a second; when a
+speech segment starts, generation continues from (about) that cycle position, and each streamed
+frame carries its cycle index so that when speech ends the loop is seeked back to exactly where the
+generated frames left off — no pose jump in either direction.
+
+**Mouth stability:** three layers — the browser captures with `noiseSuppression` +
+`echoCancellation` + `autoGainControl`; Silero VAD keeps noise from triggering lip motion at all;
+and `MUSETALK_CONTEXT_SEC` of the previous window is prepended before whisper extraction so
+window boundaries don't make the lips flutter.
 
 **Choosing the persona source video:** during silence the avatar plays your source clip untouched —
 only speech repaints the mouth. So pick (or trim to) a segment where the person is **not talking**

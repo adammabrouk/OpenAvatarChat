@@ -19,6 +19,7 @@ import json
 import time
 import uuid
 import shutil
+import struct
 import asyncio
 
 import cv2
@@ -151,9 +152,11 @@ async def live_ws(ws: WebSocket, persona_id: str):
                         break
                     try:
                         cfg = json.loads(txt)
-                        if cfg.get("type") == "config" and "silence_rms" in cfg:
-                            sess.silence_rms = max(0.0, float(cfg["silence_rms"]))
-                            logger.info(f"live[{persona_id}] silence gate -> {sess.silence_rms}")
+                        if cfg.get("type") == "config" and "gate" in cfg:
+                            sess.gate = max(0.0, float(cfg["gate"]))
+                            logger.info(f"live[{persona_id}] speech gate -> {sess.gate}")
+                        elif cfg.get("type") == "pos" and "idx" in cfg:
+                            sess.report_client_idx(int(cfg["idx"]), time.perf_counter())
                     except (ValueError, TypeError):
                         pass
         except (WebSocketDisconnect, RuntimeError):
@@ -172,14 +175,17 @@ async def live_ws(ws: WebSocket, persona_id: str):
         while not sess.stopped:
             # kick one background generation whenever a full audio window is buffered
             if sess.has_window() and (gen_task is None or gen_task.done()):
-                gen_task = asyncio.create_task(asyncio.to_thread(sess.generate_window))
+                gen_task = asyncio.create_task(
+                    asyncio.to_thread(sess.generate_window, time.perf_counter()))
             # Speech frames only, FIFO, on the fps clock. During silence NOTHING is
             # streamed — the browser falls back to the natively-looping idle.mp4.
             if sess.pending:
-                frame = sess.pending.popleft()
+                frame, idx = sess.pending.popleft()
                 ok, jpg = cv2.imencode(".jpg", frame, jpeg_params)
                 if ok:
-                    await ws.send_bytes(jpg.tobytes())
+                    # 4-byte LE cycle index prefix — lets the client seek its idle
+                    # loop back to where speech ended (continuity on fallback)
+                    await ws.send_bytes(struct.pack("<I", idx % (1 << 32)) + jpg.tobytes())
                     sent += 1
             now = time.perf_counter()
             if now - last_stats >= 1.0:
@@ -191,8 +197,9 @@ async def live_ws(ws: WebSocket, persona_id: str):
                     "audio_backlog_sec": round(sess.audio_backlog_sec(), 2),
                     "pending_frames": len(sess.pending),
                     "dropped_audio_sec": round(sess.dropped_sec, 1),
-                    "mic_rms": round(sess.mic_rms, 4),
-                    "silence_gate": round(sess.silence_rms, 4),
+                    "level": sess.level,
+                    "gate": round(sess.gate, 3),
+                    "vad": sess.vad.available,
                 }))
                 last_stats = now
                 sent_prev = sent

@@ -55,9 +55,9 @@
     <div class="row">
       <button id="lbtn" onclick="toggleLive()">🎙️ Start live</button>
       <div style="flex:1;min-width:260px">
-        <label>Silence gate: <b id="gateval">0.010</b> — mouth stays closed below this mic level
-          (your mic now: <b id="micval">–</b>)</label>
-        <input id="gate" type="range" min="0.001" max="0.05" step="0.001" value="0.010"
+        <label><span id="gatelabel">Speech gate</span>: <b id="gateval">–</b> — mouth stays closed below this
+          (your voice now: <b id="micval">–</b>)</label>
+        <input id="gate" type="range" min="0.05" max="0.95" step="0.05" value="0.5"
                style="width:100%" oninput="setGate(this.value)" />
       </div>
     </div>
@@ -118,19 +118,31 @@ async function speak() {
 // ---------- live mic mode ----------
 let liveWs = null, liveCtx = null, liveStream = null, liveProc = null;
 let livePaint = null, liveLatest = null, liveDropped = 0, lastFrameAt = 0;
+let livePos = null, lastIdx = -1, liveFps = 25, gateInit = false;
 
 // The idle loop (idle.mp4) plays natively underneath at all times. Streamed speech
-// frames paint into the overlay <img> on OUR clock at the server's fps (newest frame
-// only — bursts collapse into drops, never fast-forward). When frames stop arriving
-// (silence), the overlay fades out and the loop shows through.
+// frames (4-byte cycle-index prefix + JPEG) paint into the overlay <img> on OUR clock
+// at the server's fps (newest frame only — bursts collapse into drops, never
+// fast-forward). When frames stop arriving (silence), the overlay fades out AND the
+// idle loop is seeked to the cycle position where speech ended — no pose jump back.
 function startPainter(fps) {
   if (livePaint) clearInterval(livePaint);
+  liveFps = fps;
   const img = document.getElementById('live');
+  const vid = document.getElementById('liveidle');
   livePaint = setInterval(() => {
-    if (lastFrameAt && performance.now() - lastFrameAt > 600) img.style.opacity = 0;  // back to idle loop
+    if (lastFrameAt && performance.now() - lastFrameAt > 600 && img.style.opacity !== '0') {
+      // speech ended: resume the loop from where the generated frames left off
+      if (lastIdx >= 0 && vid.duration) {
+        const cycleFrames = Math.max(1, Math.round(vid.duration * liveFps));
+        vid.currentTime = ((lastIdx + 1) % cycleFrames) / liveFps;
+      }
+      img.style.opacity = 0;
+    }
     if (!liveLatest) return;
-    const url = URL.createObjectURL(new Blob([liveLatest], { type: 'image/jpeg' }));
-    liveLatest = null;
+    const data = liveLatest; liveLatest = null;
+    lastIdx = new DataView(data).getUint32(0, true);
+    const url = URL.createObjectURL(new Blob([data.slice(4)], { type: 'image/jpeg' }));
     img.onload = () => { URL.revokeObjectURL(url); img.style.opacity = 1; };
     img.src = url;
   }, 1000 / fps);
@@ -146,7 +158,8 @@ async function toggleLive() {
     return;
   }
   try {
-    liveStream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true } });
+    liveStream = await navigator.mediaDevices.getUserMedia({
+      audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true } });
   } catch (e) { st.textContent = '❌ mic permission denied: ' + e; return; }
 
   const proto = location.protocol === 'https:' ? 'wss' : 'ws';
@@ -160,15 +173,29 @@ async function toggleLive() {
   st.textContent = 'connecting…';
 
   startPainter(25);  // re-tuned to the real server fps on the first stats message
-  liveWs.onopen = () => setGate(document.getElementById('gate').value);  // sync slider -> session
+  gateInit = false;
+  // report the idle loop's cycle position so new speech continues from (about) there
+  livePos = setInterval(() => {
+    if (liveWs && liveWs.readyState === 1 && idleVid.duration) {
+      liveWs.send(JSON.stringify({ type: 'pos', idx: Math.floor(idleVid.currentTime * liveFps) }));
+    }
+  }, 500);
   liveWs.onmessage = (e) => {
     if (typeof e.data === 'string') {
       const s = JSON.parse(e.data);
       if (s.type === 'stats') {
         if (s.target_fps !== startPainter.fps) { startPainter(s.target_fps); startPainter.fps = s.target_fps; }
+        if (!gateInit) {  // adopt the server's gate + mode (VAD prob vs RMS energy)
+          gateInit = true;
+          const g = document.getElementById('gate');
+          document.getElementById('gatelabel').textContent = s.vad ? 'Speech gate (VAD probability)' : 'Speech gate (mic energy)';
+          if (!s.vad) { g.min = 0.001; g.max = 0.05; g.step = 0.001; }
+          g.value = s.gate;
+          document.getElementById('gateval').textContent = s.gate;
+        }
         const mv = document.getElementById('micval');
-        mv.textContent = s.mic_rms;
-        mv.style.color = s.mic_rms >= s.silence_gate ? '#16a34a' : '';  // green = above gate = will lip-sync
+        mv.textContent = s.level;
+        mv.style.color = s.level >= s.gate ? '#16a34a' : '';  // green = above gate = will lip-sync
         const lag = s.audio_backlog_sec + s.pending_frames / s.target_fps;
         st.textContent = `${s.speaking ? '🗣 speaking' : '😐 idle'} | stream ${s.sent_fps}/${s.target_fps} fps`
           + ` | lag ~${lag.toFixed(1)}s (audio buffered ${s.audio_backlog_sec}s, frames queued ${s.pending_frames})`
@@ -205,12 +232,13 @@ async function toggleLive() {
 
 function setGate(v) {
   document.getElementById('gateval').textContent = (+v).toFixed(3);
-  if (liveWs && liveWs.readyState === 1) liveWs.send(JSON.stringify({ type: 'config', silence_rms: +v }));
+  if (liveWs && liveWs.readyState === 1) liveWs.send(JSON.stringify({ type: 'config', gate: +v }));
 }
 
 function stopLive(msg) {
   if (livePaint) { clearInterval(livePaint); livePaint = null; }
-  liveLatest = null; liveDropped = 0; lastFrameAt = 0;
+  if (livePos) { clearInterval(livePos); livePos = null; }
+  liveLatest = null; liveDropped = 0; lastFrameAt = 0; lastIdx = -1;
   const idleVid = document.getElementById('liveidle');
   try { idleVid.pause(); } catch (e) {}
   document.getElementById('live').style.opacity = 0;

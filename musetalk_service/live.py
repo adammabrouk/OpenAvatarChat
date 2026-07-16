@@ -1,15 +1,21 @@
 """
 Live mic mode — realtime avatar over ONE WebSocket on the same TCP port 8000.
 
-Browser sends 16 kHz mono Int16 PCM chunks; the server slices them into
-MUSETALK_WINDOW_SEC windows, runs whisper + batched UNet/VAE per window, and
-streams JPEG frames back at MUSETALK_FPS. When no speech is buffered the
-avatar plays its idle loop (no GPU work) — one continuous cycle counter keeps
-head motion seamless across idle<->speak, same design as the LiveKit worker.
+Browser plays the persona's idle loop natively (GET /personas/{id}/idle.mp4) and sends
+16 kHz mono Int16 PCM; the server slices it into MUSETALK_WINDOW_SEC windows, gates them
+with streaming Silero VAD (the repo's own model; RMS-energy fallback), and ONLY during
+speech runs whisper + batched UNet/VAE and streams frames back (4-byte cycle-index prefix
++ JPEG). Silence costs zero GPU and zero bandwidth.
 
-Set MUSETALK_FPS to your measured generation throughput (e.g. 15 on the T4):
-if the GPU can't produce frames as fast as audio arrives, backlog grows and
-the avatar drifts behind your voice. The per-second stats message shows it.
+Stability & continuity:
+- Each window is extracted WITH the tail of the previous window prepended
+  (MUSETALK_CONTEXT_SEC) so whisper sees real audio context at the boundary instead of
+  padding — this is what stops the mouth "vibrating" between windows. The context frames
+  are dropped after extraction (no extra UNet cost).
+- One hangover window after speech renders the mouth closing naturally.
+- The client reports its idle-loop position; when a speech segment starts, the cycle
+  counter syncs to it so the generated frames continue from (about) where the loop was,
+  and the frame-index prefix lets the client seek the loop back to where speech ended.
 """
 from __future__ import annotations
 
@@ -27,33 +33,84 @@ JPEG_QUALITY = int(os.environ.get("MUSETALK_JPEG_QUALITY", "80"))
 # Live mode must stay near-realtime: if the GPU can't keep up, DROP the oldest
 # buffered audio instead of letting the avatar drift ever further behind.
 MAX_LAG_SEC = float(os.environ.get("MUSETALK_MAX_LAG_SEC", "2.0"))
-# Silence gate: a window whose loudest 100 ms stays below this RMS (float32, 1.0 = full
-# scale) is discarded without inference — the avatar idles instead of lip-fluttering on
-# room noise. ~0.01 ≈ -40 dBFS. Raise if the mouth still moves in silence, lower if it
-# misses quiet speech. 0 disables the gate.
+# Audio context prepended to each window before whisper extraction (mouth stability).
+CONTEXT_SEC = float(os.environ.get("MUSETALK_CONTEXT_SEC", "0.3"))
+# Speech gates: Silero VAD probability if the model loads, else peak-100ms-RMS energy.
+VAD_THRESHOLD = float(os.environ.get("MUSETALK_VAD_THRESHOLD", "0.5"))
 SILENCE_RMS = float(os.environ.get("MUSETALK_SILENCE_RMS", "0.01"))
+
+
+class StreamVad:
+    """Streaming Silero VAD on 512-sample chunks, reusing the ONNX model that ships
+    with OpenAvatarChat's own VAD handler. State persists across windows, so this is
+    true streaming VAD over the continuous mic signal."""
+
+    CHUNK = 512  # 32 ms @ 16 kHz — what the silero model expects
+
+    def __init__(self, sr: int):
+        self.sr = sr
+        self.session = None
+        self._rest = np.zeros(0, dtype=np.float32)
+        try:
+            import onnxruntime
+            path = os.path.join(engine.OAC_ROOT, "src", "handlers", "vad", "silerovad",
+                                "silero_vad", "src", "silero_vad", "data", "silero_vad.onnx")
+            opts = onnxruntime.SessionOptions()
+            opts.inter_op_num_threads = 1
+            opts.intra_op_num_threads = 1
+            opts.log_severity_level = 4
+            self.session = onnxruntime.InferenceSession(
+                path, providers=["CPUExecutionProvider"], sess_options=opts)
+            self._state = np.zeros((2, 1, 128), dtype=np.float32)
+            self._sr_arr = np.array([sr], dtype=np.int64)
+            logger.info(f"live VAD: silero loaded ({path})")
+        except Exception as e:
+            logger.warning(f"live VAD: silero unavailable ({e}) — falling back to RMS energy gate")
+
+    @property
+    def available(self) -> bool:
+        return self.session is not None
+
+    def max_prob(self, seg: np.ndarray) -> float:
+        """Max speech probability over the segment's 512-sample chunks (streaming state)."""
+        buf = np.concatenate([self._rest, seg]) if len(self._rest) else seg
+        n = len(buf) // self.CHUNK
+        peak = 0.0
+        for i in range(n):
+            clip = buf[i * self.CHUNK:(i + 1) * self.CHUNK][np.newaxis, :]
+            prob, self._state = self.session.run(
+                None, {"input": clip, "sr": self._sr_arr, "state": self._state})
+            peak = max(peak, float(prob[0][0]))
+        self._rest = buf[n * self.CHUNK:]
+        return peak
 
 
 class LiveSession:
     """Per-connection state. Audio in (any thread) -> generate_window() (worker
-    thread, blocking GPU) -> `pending` frames consumed by the paced sender loop."""
+    thread, blocking GPU) -> `pending` (frame, cycle_idx) consumed by the sender loop."""
 
     def __init__(self, algo):
         self.algo = algo
         self.sr = engine.ALGO_SR
         self.fps = engine.FPS
         self.window_samples = int(WINDOW_SEC * self.sr)
+        self.context_samples = int(CONTEXT_SEC * self.sr)
         self._audio = np.zeros(0, dtype=np.float32)
         self._audio_lock = threading.Lock()
         self._clock_lock = threading.Lock()
-        self._counter = 0  # ONE continuous cycle counter for idle AND speak frames
-        self.pending: deque = deque()  # blended BGR frames ready to send (thread-safe ops only)
+        self._counter = 0  # cycle position of generated frames
+        self.pending: deque = deque()  # (BGR frame, cycle idx) ready to send
         self.stopped = False
-        self.dropped_sec = 0.0  # audio discarded to keep the avatar near-realtime
-        self.silent_windows = 0  # windows skipped by the silence gate
-        self.mic_rms = 0.0  # peak 100ms RMS of the last window (helps tune the gate)
-        self.silence_rms = SILENCE_RMS  # per-session gate — adjustable live from the UI
-        self._hangover = 0  # silent windows still rendered after speech (closes the mouth naturally)
+        self.dropped_sec = 0.0   # audio discarded to keep the avatar near-realtime
+        self.silent_windows = 0  # windows skipped by the speech gate
+        self.vad = StreamVad(self.sr)
+        self.gate = VAD_THRESHOLD if self.vad.available else SILENCE_RMS  # UI-adjustable
+        self.level = 0.0         # last window's VAD prob (or RMS) — shown in the UI
+        self._tail = np.zeros(0, dtype=np.float32)  # previous window's tail (whisper context)
+        self._hangover = 0       # silent windows still rendered after speech (mouth closes)
+        self._speaking = False   # inside a speech segment?
+        self._client_idx: int | None = None  # client's reported idle-loop position
+        self._client_idx_at = 0.0
         self._max_buffer = self.window_samples + int(MAX_LAG_SEC * self.sr)
 
     # ---- audio in (websocket receiver) ----
@@ -65,6 +122,10 @@ class LiveSession:
             if overflow > 0:  # GPU behind — drop the OLDEST audio, keep the newest
                 self._audio = self._audio[overflow:]
                 self.dropped_sec += overflow / self.sr
+
+    def report_client_idx(self, idx: int, now: float):
+        self._client_idx = int(idx)
+        self._client_idx_at = now
 
     def audio_backlog_sec(self) -> float:
         return len(self._audio) / self.sr
@@ -81,56 +142,66 @@ class LiveSession:
             return seg
 
     # ---- frame clock ----
-    def _reserve_indices(self, n: int) -> int:
+    def _reserve_indices(self, n: int, now: float) -> int:
         with self._clock_lock:
+            if not self._speaking and self._client_idx is not None:
+                # New speech segment: continue from (about) where the client's idle
+                # loop is NOW + the lag until these frames actually show (~1 window).
+                elapsed = max(0.0, now - self._client_idx_at)
+                self._counter = self._client_idx + int(self.fps * (elapsed + WINDOW_SEC))
             start = self._counter
             self._counter += n
             return start
 
-    def next_idle_frame(self) -> np.ndarray:
-        with self._clock_lock:
-            idx = self._counter
-            self._counter += 1
-        return self.algo.generate_idle_frame(idx)  # looped source frame, no GPU
-
-    def _is_speech(self, seg: np.ndarray) -> bool:
-        """Energy gate: speech if ANY 100 ms sub-chunk exceeds the session gate.
-        (Any-chunk, not average, so a word at the edge of a quiet window still passes.)"""
-        step = max(1, int(0.1 * self.sr))
-        peak = 0.0
-        for i in range(0, len(seg), step):
-            c = seg[i:i + step]
-            if len(c):
-                peak = max(peak, float(np.sqrt(np.mean(c * c))))
-        self.mic_rms = peak
-        return self.silence_rms <= 0 or peak >= self.silence_rms
+    def _measure(self, seg: np.ndarray) -> bool:
+        """Speech gate. Silero VAD prob (streaming) when available, else peak-100ms RMS."""
+        if self.vad.available:
+            self.level = round(self.vad.max_prob(seg), 3)
+        else:
+            step = max(1, int(0.1 * self.sr))
+            peak = 0.0
+            for i in range(0, len(seg), step):
+                c = seg[i:i + step]
+                if len(c):
+                    peak = max(peak, float(np.sqrt(np.mean(c * c))))
+            self.level = round(peak, 4)
+        return self.gate <= 0 or self.level >= self.gate
 
     # ---- generation (blocking; run via asyncio.to_thread) ----
-    def generate_window(self) -> int:
-        """One audio window -> whisper -> batched frames appended to `pending`.
-        Returns the number of frames generated (0 if no full window buffered,
-        or if the window was silence — then the idle loop plays instead)."""
+    def generate_window(self, now: float) -> int:
+        """One audio window -> gate -> whisper (with context) -> batched frames.
+        Returns frames generated (0 = no full window, or silence -> client shows its loop)."""
         seg = self._take_window()
         if seg is None:
             return 0
-        if self._is_speech(seg):
+        context = self._tail
+        self._tail = seg[-self.context_samples:] if self.context_samples > 0 else self._tail
+
+        if self._measure(seg):
             self._hangover = 1
         elif self._hangover > 0:
-            # Speech just ended: render ONE silent window anyway — inference on
-            # silence closes the mouth naturally instead of hard-cutting to the
-            # source frame mid-phoneme.
-            self._hangover -= 1
+            self._hangover -= 1  # render ONE silent window: the mouth closes naturally
         else:
+            self._speaking = False
             self.silent_windows += 1
             return 0
-        chunks = self.algo.extract_whisper_feature(seg, self.sr)
+
+        # Whisper sees context + window; the context's frames are dropped afterwards, so
+        # the kept frames get real boundary context (stable mouth) at no extra UNet cost.
+        full = np.concatenate([context, seg]) if len(context) else seg
+        chunks = self.algo.extract_whisper_feature(full, self.sr)
+        # keep exactly one window's worth of frames; everything before is context
+        frames_per_window = int(round(self.window_samples / self.sr * self.fps))
+        n_drop = max(len(chunks) - frames_per_window, 0)
+        chunks = chunks[n_drop:]
         n = len(chunks)
         if n == 0:
             return 0
-        start = self._reserve_indices(n)
+        start = self._reserve_indices(n, now)
+        self._speaking = True
         batch = engine.BATCH
         for i in range(0, n, batch):
             wb = chunks[i:i + batch]
             for recon, idx in self.algo.generate_frames(wb, start + i, len(wb)):
-                self.pending.append(self.algo.res2combined(recon, idx))
+                self.pending.append((self.algo.res2combined(recon, idx), idx))
         return n
